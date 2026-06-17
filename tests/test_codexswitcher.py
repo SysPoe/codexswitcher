@@ -107,6 +107,50 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertIn('model_provider = "packycode"', config)
         self.assertEqual(json.loads((self.codex_home / "auth.json").read_text()), {"kind": "old"})
 
+    def test_use_preserves_active_reasoning_effort(self) -> None:
+        switcher = codexswitcher.Switcher(self.store, self.codex_home, "codex")
+        switcher.create_provider_context(
+            name="openai-xhigh",
+            provider_id="openai",
+            model="gpt-context",
+            provider_name=None,
+            base_url=None,
+            wire_api=None,
+            supports_websockets=None,
+            env_key=None,
+            api_key=None,
+            requires_openai_auth=False,
+            reasoning_effort="xhigh",
+            overwrite=False,
+        )
+        (self.codex_home / "config.toml").write_text(
+            textwrap.dedent(
+                """
+                model = "gpt-5.5"
+                model_provider = "packycode"
+                model_reasoning_effort = "medium"
+                model_verbosity = "low"
+
+                [model_providers.packycode]
+                name = "PackyAPI"
+                base_url = "https://www.packyapi.com/v1"
+                experimental_bearer_token = "secret-token"
+                wire_api = "responses"
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        switcher.use("openai-xhigh")
+
+        config = (self.codex_home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('model_provider = "openai"', config)
+        self.assertIn('model = "gpt-5.5"', config)
+        self.assertIn('model_reasoning_effort = "medium"', config)
+        self.assertIn('model_verbosity = "low"', config)
+        self.assertNotIn('model = "gpt-context"', config)
+        self.assertNotIn('model_reasoning_effort = "xhigh"', config)
+
     def test_tui_reopens_after_switch_and_delete_actions(self) -> None:
         switcher = codexswitcher.Switcher(self.store, self.codex_home, "codex")
         switcher.capture("packy")

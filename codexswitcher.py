@@ -1268,11 +1268,20 @@ def preserve_active_model_settings(target_config: dict[str, Any], active_config_
     if not active_config_path.exists():
         return
     active_config = read_toml(active_config_path)
-    for key in ("model", "model_reasoning_effort"):
+    model_keys = {
+        key
+        for key in set(target_config) | set(active_config)
+        if is_model_setting_key(key)
+    }
+    for key in model_keys:
         if key in active_config:
             target_config[key] = active_config[key]
         else:
             target_config.pop(key, None)
+
+
+def is_model_setting_key(key: str) -> bool:
+    return key == "model" or (key.startswith("model_") and key != "model_provider")
 
 
 def fetch_rate_limits_from_codex_home(
