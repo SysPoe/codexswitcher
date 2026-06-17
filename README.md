@@ -6,19 +6,40 @@ Use it when you want to keep separate Codex accounts or provider settings and sw
 
 ## Quick Start
 
-Open the selector:
+Open the selector on macOS/Linux:
 
 ```bash
 python3 codexswitcher.py
 ```
 
-Use Up/Down or `j`/`k` to choose a context, Enter to activate it, `n` to add a new context, and `q` or Esc to quit.
+On Windows, use the native PowerShell entry point (Python is not required):
+
+```powershell
+.\codexswitcher.ps1
+```
+
+You can also run `codexswitcher.cmd` from PowerShell or Command Prompt.
+
+Install the short `cdxsw` command into `~/.local/bin`:
+
+```powershell
+.\install-windows.ps1
+cdxsw status
+```
+
+The installer creates launchers for PowerShell, Command Prompt, and Git Bash.
+
+Use Up/Down to choose a context, Enter to activate it, `n` to add a new
+context, and `q` or Esc to quit. The Python selector also supports `j`/`k`.
 
 Save your current Codex setup as a context:
 
 ```bash
 python3 codexswitcher.py capture work
 ```
+
+On Windows, replace `python3 codexswitcher.py` in the examples with
+`.\codexswitcher.ps1`.
 
 Switch to a saved context:
 
@@ -60,5 +81,10 @@ python3 codexswitcher.py run personal -- codex login status
 ## Tips
 
 - Use `--env-key` instead of `--api-key` when you want secrets to come from an environment variable.
-- Restart Codex after switching contexts if another Codex process is already running.
+- The Windows CLI and Codex app share `%USERPROFILE%\.codex` by default.
+- Restart the Codex app after switching contexts. On Windows, pass `--restart-app`
+  to `use` or `login --use` to stop and relaunch the installed app automatically.
+- The native Windows entry point supports `tui`, `capture`, `use`, `login`,
+  `run`, `list`, and `status`. Custom `provider` creation remains available
+  through the Python entry point.
 - Saved contexts and backups live under `~/.codex-switcher/`.
