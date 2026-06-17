@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - Windows fallback.
 CONTEXT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 BARE_TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BUILTIN_PROVIDERS = {"openai", "ollama", "lmstudio", "amazon-bedrock"}
+TUI_POPUP_SECONDS = 3.0
 
 
 class SwitcherError(RuntimeError):
@@ -87,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         aliases=["save"],
         help="Save the current CODEX_HOME config/auth as a named context.",
     )
-    capture.add_argument("name", help="Context name, e.g. packy or work-chatgpt.")
+    capture.add_argument("name", help="Context name, e.g. custom-context or work-chatgpt.")
     capture.add_argument("--overwrite", action="store_true", help="Replace an existing context.")
     capture.set_defaults(func=cmd_capture)
 
@@ -162,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--model", default="gpt-5.5", help="Model to put in the login context.")
     login.add_argument(
         "--base-url",
-        help="Optional API base URL to store in the login context, e.g. https://www.packyapi.com/v1.",
+        help="Optional API base URL to store in the login context, e.g. https://api.example.test/v1.",
     )
     login.add_argument("--device-auth", action="store_true", help="Pass --device-auth to codex login.")
     auth_source = login.add_mutually_exclusive_group()
@@ -283,7 +284,7 @@ def cmd_tui(switcher: "Switcher", args: argparse.Namespace) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             print(f"no contexts saved in {switcher.store}")
             print(
-                "Create one with `python3 codexswitcher.py capture packy` "
+                "Create one with `python3 codexswitcher.py capture custom-context` "
                 "or `python3 codexswitcher.py login personal-chatgpt`."
             )
             return 0
@@ -420,23 +421,37 @@ def select_context_tui(rows: list[dict[str, str]], switcher: "Switcher", initial
         stdscr.keypad(True)
         selected = next((index for index, row in enumerate(rows) if row["active"] == "*"), 0)
         top = 0
-        message = initial_message
+        popup_message = initial_message
+        popup_expires_at = time.monotonic() + TUI_POPUP_SECONDS if popup_message else 0.0
         refresh_queue = start_limit_refresh(switcher, rows)
         fetching_limits = has_refreshable_limits(rows)
         stdscr.timeout(200)
+
+        def show_popup(text: str) -> None:
+            nonlocal popup_message, popup_expires_at
+            popup_message = text
+            popup_expires_at = time.monotonic() + TUI_POPUP_SECONDS
+
+        def clear_popup() -> None:
+            nonlocal popup_message, popup_expires_at
+            popup_message = ""
+            popup_expires_at = 0.0
 
         while True:
             updated, finished_refresh = apply_limit_refresh_updates(rows, refresh_queue)
             if finished_refresh:
                 fetching_limits = False
             if updated:
-                if not message:
-                    message = "Rate limits updated."
+                if not popup_message:
+                    show_popup("Rate limits updated.")
 
             stdscr.erase()
             height, width = stdscr.getmaxyx()
+            if popup_message and time.monotonic() >= popup_expires_at:
+                clear_popup()
             detail_lines = 8
-            list_height = max(1, height - detail_lines - 5)
+            bottom_reserved = 1 if height > 1 else 0
+            list_height = max(1, height - detail_lines - bottom_reserved - 5)
             if rows:
                 selected = max(0, min(selected, len(rows) - 1))
             else:
@@ -486,8 +501,9 @@ def select_context_tui(rows: list[dict[str, str]], switcher: "Switcher", initial
                 add_line(stdscr, detail_y + 7, 0, f"weekly:        {row['weekly_detail']}", width)
             else:
                 add_line(stdscr, detail_y + 1, 0, "Press n to sign in with ChatGPT and save the account as a context.", width)
-            if message:
-                add_line(stdscr, height - 1, 0, message, width, curses.A_BOLD)
+
+            if popup_message:
+                add_popup(stdscr, height - 1, popup_message, width, curses.A_REVERSE)
             elif fetching_limits:
                 add_line(stdscr, height - 1, 0, "Fetching rate limits...", width, curses.A_BOLD)
             stdscr.refresh()
@@ -496,21 +512,27 @@ def select_context_tui(rows: list[dict[str, str]], switcher: "Switcher", initial
             if key == -1:
                 continue
             if key in (curses.KEY_UP, ord("k")):
+                clear_popup()
                 selected -= 1
             elif key in (curses.KEY_DOWN, ord("j")):
+                clear_popup()
                 selected += 1
             elif key in (curses.KEY_NPAGE, ord(" ")):
+                clear_popup()
                 selected += list_height
             elif key == curses.KEY_PPAGE:
+                clear_popup()
                 selected -= list_height
             elif key in (curses.KEY_HOME, ord("g")):
+                clear_popup()
                 selected = 0
             elif key in (curses.KEY_END, ord("G")):
+                clear_popup()
                 selected = len(rows) - 1
             elif key in (10, 13, curses.KEY_ENTER):
                 if rows:
                     action = {"action": "use", "name": rows[selected]["name"]}
-                    message = execute_tui_action_in_place(stdscr, switcher, action)
+                    show_popup(execute_tui_action_in_place(stdscr, switcher, action))
                     rows = switcher.list_contexts(refresh_limits=False)
                     refresh_queue = start_limit_refresh(switcher, rows)
                     fetching_limits = has_refreshable_limits(rows)
@@ -519,11 +541,12 @@ def select_context_tui(rows: list[dict[str, str]], switcher: "Switcher", initial
                         selected,
                     )
                 else:
-                    message = "No context selected. Press n to create one."
+                    show_popup("No context selected. Press n to create one.")
             elif key == ord("n"):
+                clear_popup()
                 login_action = prompt_new_login_tui(stdscr)
                 if login_action is not None:
-                    message = execute_tui_action_in_place(stdscr, switcher, login_action)
+                    show_popup(execute_tui_action_in_place(stdscr, switcher, login_action))
                     rows = switcher.list_contexts(refresh_limits=False)
                     refresh_queue = start_limit_refresh(switcher, rows)
                     fetching_limits = has_refreshable_limits(rows)
@@ -532,21 +555,23 @@ def select_context_tui(rows: list[dict[str, str]], switcher: "Switcher", initial
                         selected,
                     )
             elif key == curses.KEY_DC:
+                clear_popup()
                 if rows and confirm_delete_context_tui(stdscr, rows[selected]["name"]):
                     action = {"action": "delete", "name": rows[selected]["name"]}
-                    message = execute_tui_action_in_place(stdscr, switcher, action)
+                    show_popup(execute_tui_action_in_place(stdscr, switcher, action))
                     rows = switcher.list_contexts(refresh_limits=False)
                     refresh_queue = start_limit_refresh(switcher, rows)
                     fetching_limits = has_refreshable_limits(rows)
                     selected = min(selected, max(0, len(rows) - 1))
                 else:
-                    message = "Delete cancelled."
+                    show_popup("Delete cancelled.")
             elif key in (27, ord("q")):
                 return
             elif key == curses.KEY_RESIZE:
+                clear_popup()
                 continue
             else:
-                message = "Unknown key. Use Enter to activate, Delete to delete, n to add, or q to cancel."
+                show_popup("Unknown key. Use Enter to activate, Delete to delete, n to add, or q to cancel.")
 
     try:
         return curses.wrapper(run)
@@ -661,7 +686,7 @@ def prompt_new_login_tui(stdscr: Any) -> dict[str, str] | None:
         ("device", "ChatGPT device-code login for SSH/headless sessions"),
         ("api-key", "OpenAI API key for OpenAI endpoints"),
         ("access-token", "Codex access token from hidden prompt"),
-        ("provider", "Custom provider API key, e.g. PackyAPI"),
+        ("provider", "Custom provider API key, e.g. Custom API"),
     ]
     selected = 0
     while True:
@@ -695,7 +720,7 @@ def prompt_new_login_tui(stdscr: Any) -> dict[str, str] | None:
 
 
 def prompt_provider_config_tui(stdscr: Any, name: str, api_key: str) -> dict[str, str] | None:
-    provider_id = read_curses_prompt(stdscr, "Provider id (for example packycode): ")
+    provider_id = read_curses_prompt(stdscr, "Provider id (for example customapi): ")
     if provider_id is None:
         return None
     provider_id = provider_id.strip()
@@ -777,6 +802,21 @@ def show_curses_message(stdscr: Any, message: str) -> None:
     stdscr.getch()
 
 
+def add_popup(stdscr: Any, y: int, text: str, width: int, attr: int = 0) -> None:
+    if y < 0:
+        return
+    height, _ = stdscr.getmaxyx()
+    if y >= height or width <= 1:
+        return
+    add_line(stdscr, y, 0, "", width)
+    popup_text = f" {text} "
+    max_chars = max(1, width - 1)
+    if len(popup_text) > max_chars:
+        popup_text = popup_text[:max_chars]
+    x = max(0, (width - len(popup_text)) // 2)
+    stdscr.addnstr(y, x, popup_text, max_chars, attr)
+
+
 def add_line(stdscr: Any, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     if y < 0:
         return
@@ -788,7 +828,10 @@ def add_line(stdscr: Any, y: int, x: int, text: str, width: int, attr: int = 0) 
     max_chars = max(0, width - x - 1)
     if max_chars == 0:
         return
-    stdscr.addnstr(y, x, text, max_chars, attr)
+    stdscr.move(y, x)
+    stdscr.clrtoeol()
+    if text:
+        stdscr.addnstr(y, x, text, max_chars, attr)
 
 
 def cmd_status(switcher: "Switcher", args: argparse.Namespace) -> int:
@@ -1438,15 +1481,12 @@ def detail_window(window: dict[str, Any] | None, label: str) -> str:
     if not window:
         return f"{label}: unavailable"
     percent = value_by_keys(window, "usedPercent", "used_percent")
-    minutes = value_by_keys(window, "windowDurationMins", "window_minutes")
     resets_at = value_by_keys(window, "resetsAt", "resets_at")
     parts = [label]
     if isinstance(percent, (int, float)):
         parts.append(f"{percent:.0f}% used")
     else:
         parts.append("usage unknown")
-    if isinstance(minutes, int):
-        parts.append(f"{minutes}m window")
     if isinstance(resets_at, int):
         parts.append(f"resets {format_epoch(resets_at)}")
     return "; ".join(parts)

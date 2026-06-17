@@ -36,12 +36,12 @@ class CodexSwitcherTests(unittest.TestCase):
                 """
                 approvals_reviewer = "guardian_subagent"
                 model = "gpt-5.5"
-                model_provider = "packycode"
+                model_provider = "customapi"
                 model_reasoning_effort = "xhigh"
 
-                [model_providers.packycode]
-                name = "PackyAPI"
-                base_url = "https://www.packyapi.com/v1"
+                [model_providers.customapi]
+                name = "Custom API"
+                base_url = "https://api.example.test/v1"
                 experimental_bearer_token = "secret-token"
                 wire_api = "responses"
 
@@ -76,11 +76,11 @@ class CodexSwitcherTests(unittest.TestCase):
         return subprocess.run(cmd, input=input_text, text=True, capture_output=True, check=False)
 
     def test_capture_and_use_round_trip(self) -> None:
-        result = self.run_switcher("capture", "packy")
+        result = self.run_switcher("capture", "custom-context")
         self.assertEqual(result.returncode, 0, result.stderr)
-        captured_config = self.store / "contexts" / "packy" / "config.toml"
+        captured_config = self.store / "contexts" / "custom-context" / "config.toml"
         self.assertTrue(captured_config.exists())
-        self.assertTrue((self.store / "contexts" / "packy" / "auth.json").exists())
+        self.assertTrue((self.store / "contexts" / "custom-context" / "auth.json").exists())
         self.assertEqual(stat.S_IMODE(captured_config.stat().st_mode), 0o600)
 
         self.run_switcher(
@@ -101,10 +101,10 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort = "xhigh"', config)
         self.assertFalse((self.codex_home / "auth.json").exists())
 
-        result = self.run_switcher("use", "packy")
+        result = self.run_switcher("use", "custom-context")
         self.assertEqual(result.returncode, 0, result.stderr)
         config = (self.codex_home / "config.toml").read_text(encoding="utf-8")
-        self.assertIn('model_provider = "packycode"', config)
+        self.assertIn('model_provider = "customapi"', config)
         self.assertEqual(json.loads((self.codex_home / "auth.json").read_text()), {"kind": "old"})
 
     def test_use_preserves_active_reasoning_effort(self) -> None:
@@ -127,13 +127,13 @@ class CodexSwitcherTests(unittest.TestCase):
             textwrap.dedent(
                 """
                 model = "gpt-5.5"
-                model_provider = "packycode"
+                model_provider = "customapi"
                 model_reasoning_effort = "medium"
                 model_verbosity = "low"
 
-                [model_providers.packycode]
-                name = "PackyAPI"
-                base_url = "https://www.packyapi.com/v1"
+                [model_providers.customapi]
+                name = "Custom API"
+                base_url = "https://api.example.test/v1"
                 experimental_bearer_token = "secret-token"
                 wire_api = "responses"
                 """
@@ -153,7 +153,7 @@ class CodexSwitcherTests(unittest.TestCase):
 
     def test_tui_reopens_after_switch_and_delete_actions(self) -> None:
         switcher = codexswitcher.Switcher(self.store, self.codex_home, "codex")
-        switcher.capture("packy")
+        switcher.capture("custom-context")
         switcher.create_provider_context(
             name="openai-work",
             provider_id="openai",
@@ -171,7 +171,7 @@ class CodexSwitcherTests(unittest.TestCase):
         actions = iter(
             [
                 {"action": "use", "name": "openai-work"},
-                {"action": "delete", "name": "packy"},
+                {"action": "delete", "name": "custom-context"},
                 None,
             ]
         )
@@ -204,30 +204,30 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "")
         self.assertIn("openai-work", calls[1][2])
         self.assertIn("activated context 'openai-work'", calls[1][1])
-        self.assertNotIn("packy", calls[2][0])
-        self.assertIn("deleted context 'packy'", calls[2][1])
-        self.assertFalse((self.store / "contexts" / "packy").exists())
+        self.assertNotIn("custom-context", calls[2][0])
+        self.assertIn("deleted context 'custom-context'", calls[2][1])
+        self.assertFalse((self.store / "contexts" / "custom-context").exists())
 
     def test_provider_context_preserves_unrelated_config(self) -> None:
         result = self.run_switcher(
             "provider",
-            "packy-env",
+            "custom-env",
             "--provider-id",
-            "packycode",
+            "customapi",
             "--model",
             "gpt-5.5",
             "--env-key",
-            "PACKY_API_KEY",
+            "CUSTOM_API_KEY",
             "--overwrite",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        config_path = self.store / "contexts" / "packy-env" / "config.toml"
+        config_path = self.store / "contexts" / "custom-env" / "config.toml"
         config = config_path.read_text(encoding="utf-8")
         self.assertIn('[projects."/tmp/example"]', config)
         self.assertIn('[plugins."github@openai-curated"]', config)
-        self.assertIn('base_url = "https://www.packyapi.com/v1"', config)
+        self.assertIn('base_url = "https://api.example.test/v1"', config)
         self.assertIn("supports_websockets = false", config)
-        self.assertIn('env_key = "PACKY_API_KEY"', config)
+        self.assertIn('env_key = "CUSTOM_API_KEY"', config)
         self.assertNotIn("secret-token", config)
 
     def test_existing_provider_accepts_api_key_without_reentering_base_url(self) -> None:
@@ -235,7 +235,7 @@ class CodexSwitcherTests(unittest.TestCase):
             "provider",
             "existing-provider-key",
             "--provider-id",
-            "packycode",
+            "customapi",
             "--model",
             "gpt-5.5",
             "--api-key",
@@ -243,8 +243,8 @@ class CodexSwitcherTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         config = (self.store / "contexts" / "existing-provider-key" / "config.toml").read_text(encoding="utf-8")
-        self.assertIn('model_provider = "packycode"', config)
-        self.assertIn('base_url = "https://www.packyapi.com/v1"', config)
+        self.assertIn('model_provider = "customapi"', config)
+        self.assertIn('base_url = "https://api.example.test/v1"', config)
         self.assertIn('wire_api = "responses"', config)
         self.assertIn("supports_websockets = false", config)
         self.assertIn('experimental_bearer_token = "new-secret-token"', config)
@@ -254,7 +254,7 @@ class CodexSwitcherTests(unittest.TestCase):
             "provider",
             "existing-provider-current-key",
             "--provider-id",
-            "packycode",
+            "customapi",
             "--model",
             "gpt-5.5",
         )
@@ -262,8 +262,8 @@ class CodexSwitcherTests(unittest.TestCase):
         config = (self.store / "contexts" / "existing-provider-current-key" / "config.toml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('model_provider = "packycode"', config)
-        self.assertIn('base_url = "https://www.packyapi.com/v1"', config)
+        self.assertIn('model_provider = "customapi"', config)
+        self.assertIn('base_url = "https://api.example.test/v1"', config)
         self.assertIn("supports_websockets = false", config)
         self.assertIn('experimental_bearer_token = "secret-token"', config)
 
@@ -272,7 +272,7 @@ class CodexSwitcherTests(unittest.TestCase):
             "provider",
             "missing-base",
             "--provider-id",
-            "customapi",
+            "unknownapi",
             "--model",
             "gpt-5.5",
             "--api-key",
@@ -306,22 +306,22 @@ class CodexSwitcherTests(unittest.TestCase):
         config_path.write_text(
             config_path.read_text(encoding="utf-8").replace(
                 'model_reasoning_effort = "xhigh"',
-                'model_reasoning_effort = "xhigh"\nopenai_base_url = "https://www.packyapi.com/v1"',
+                'model_reasoning_effort = "xhigh"\nopenai_base_url = "https://api.example.test/v1"',
             ),
             encoding="utf-8",
         )
         result = self.run_switcher(
             "provider",
-            "packy-custom",
+            "custom-provider",
             "--provider-id",
-            "packycode",
+            "customapi",
             "--model",
             "gpt-5.5",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        config = (self.store / "contexts" / "packy-custom" / "config.toml").read_text(encoding="utf-8")
-        self.assertIn('model_provider = "packycode"', config)
-        self.assertIn('base_url = "https://www.packyapi.com/v1"', config)
+        config = (self.store / "contexts" / "custom-provider" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('model_provider = "customapi"', config)
+        self.assertIn('base_url = "https://api.example.test/v1"', config)
         self.assertIn("supports_websockets = false", config)
         self.assertNotIn("openai_base_url", config)
 
@@ -357,7 +357,7 @@ class CodexSwitcherTests(unittest.TestCase):
             "provider",
             "manual-provider-default-no-ws",
             "--provider-id",
-            "packycode",
+            "customapi",
             "--model",
             "gpt-5.5",
             "--api-key",
@@ -367,7 +367,7 @@ class CodexSwitcherTests(unittest.TestCase):
         config = (self.store / "contexts" / "manual-provider-default-no-ws" / "config.toml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('model_provider = "packycode"', config)
+        self.assertIn('model_provider = "customapi"', config)
         self.assertIn("supports_websockets = false", config)
 
     def test_custom_provider_can_force_responses_websockets_off(self) -> None:
@@ -383,7 +383,7 @@ class CodexSwitcherTests(unittest.TestCase):
             "provider",
             "manual-provider-no-ws",
             "--provider-id",
-            "packycode",
+            "customapi",
             "--model",
             "gpt-5.5",
             "--api-key",
@@ -392,7 +392,7 @@ class CodexSwitcherTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         config = (self.store / "contexts" / "manual-provider-no-ws" / "config.toml").read_text(encoding="utf-8")
-        self.assertIn('model_provider = "packycode"', config)
+        self.assertIn('model_provider = "customapi"', config)
         self.assertIn("supports_websockets = false", config)
 
     def test_login_uses_isolated_home_and_stores_auth(self) -> None:
@@ -568,7 +568,7 @@ class CodexSwitcherTests(unittest.TestCase):
                 home = pathlib.Path(os.environ["CODEX_HOME"])
                 config = (home / "config.toml").read_text()
                 assert 'model_provider = "openai"' in config
-                assert 'openai_base_url = "https://www.packyapi.com/v1"' in config
+                assert 'openai_base_url = "https://api.example.test/v1"' in config
                 assert os.environ["CODEX_HOME"].endswith("/api-key-with-base")
                 assert pathlib.Path(os.environ["CODEX_HOME"]).is_dir()
                 (home / "auth.json").write_text(json.dumps({"kind": "api-key-login"}) + "\\n")
@@ -591,15 +591,15 @@ class CodexSwitcherTests(unittest.TestCase):
             "api-key-with-base",
             "--with-api-key",
             "--base-url",
-            "https://www.packyapi.com/v1",
+            "https://api.example.test/v1",
         ]
         result = subprocess.run(cmd, input="sk-test\n", text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = (self.store / "contexts" / "api-key-with-base" / "config.toml").read_text(encoding="utf-8")
-        self.assertIn('openai_base_url = "https://www.packyapi.com/v1"', config)
+        self.assertIn('openai_base_url = "https://api.example.test/v1"', config)
 
     def test_run_sets_isolated_codex_home_and_syncs_auth(self) -> None:
-        self.assertEqual(self.run_switcher("capture", "packy").returncode, 0)
+        self.assertEqual(self.run_switcher("capture", "custom-context").returncode, 0)
         helper = self.root / "helper.py"
         helper.write_text(
             textwrap.dedent(
@@ -609,15 +609,15 @@ class CodexSwitcherTests(unittest.TestCase):
                 from pathlib import Path
 
                 home = Path(os.environ["CODEX_HOME"])
-                assert home.name == "packy"
+                assert home.name == "custom-context"
                 (home / "auth.json").write_text(json.dumps({"kind": "refreshed"}) + "\\n")
                 """
             ),
             encoding="utf-8",
         )
-        result = self.run_switcher("run", "packy", "--", sys.executable, str(helper))
+        result = self.run_switcher("run", "custom-context", "--", sys.executable, str(helper))
         self.assertEqual(result.returncode, 0, result.stderr)
-        auth_path = self.store / "contexts" / "packy" / "auth.json"
+        auth_path = self.store / "contexts" / "custom-context" / "auth.json"
         self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8")), {"kind": "refreshed"})
 
     def test_list_fetches_fresh_rate_limits_for_signed_in_openai_context(self) -> None:
