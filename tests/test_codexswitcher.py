@@ -81,7 +81,8 @@ class CodexSwitcherTests(unittest.TestCase):
         captured_config = self.store / "contexts" / "custom-context" / "config.toml"
         self.assertTrue(captured_config.exists())
         self.assertTrue((self.store / "contexts" / "custom-context" / "auth.json").exists())
-        self.assertEqual(stat.S_IMODE(captured_config.stat().st_mode), 0o600)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(captured_config.stat().st_mode), 0o600)
 
         self.run_switcher(
             "provider",
@@ -151,6 +152,7 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertNotIn('model = "gpt-context"', config)
         self.assertNotIn('model_reasoning_effort = "xhigh"', config)
 
+    @unittest.skipIf(os.name == "nt", "curses selector flow is not used on Windows")
     def test_tui_reopens_after_switch_and_delete_actions(self) -> None:
         switcher = codexswitcher.Switcher(self.store, self.codex_home, "codex")
         switcher.capture("custom-context")
@@ -300,6 +302,24 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertIn('base_url = "https://api.example.test/v1"', config)
         self.assertIn("supports_websockets = false", config)
         self.assertIn('experimental_bearer_token = "secret-token"', config)
+
+    def test_new_custom_provider_defaults_provider_name_to_provider_id(self) -> None:
+        result = self.run_switcher(
+            "provider",
+            "manual-provider-name",
+            "--provider-id",
+            "newcustom",
+            "--model",
+            "gpt-5.5",
+            "--base-url",
+            "https://api.example.test/v1",
+            "--api-key",
+            "secret-token",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = (self.store / "contexts" / "manual-provider-name" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('[model_providers.newcustom]', config)
+        self.assertIn('name = "newcustom"', config)
 
     def test_custom_provider_removes_stale_openai_base_url(self) -> None:
         config_path = self.codex_home / "config.toml"
@@ -569,7 +589,7 @@ class CodexSwitcherTests(unittest.TestCase):
                 config = (home / "config.toml").read_text()
                 assert 'model_provider = "openai"' in config
                 assert 'openai_base_url = "https://api.example.test/v1"' in config
-                assert os.environ["CODEX_HOME"].endswith("/api-key-with-base")
+                assert pathlib.Path(os.environ["CODEX_HOME"]).name == "api-key-with-base"
                 assert pathlib.Path(os.environ["CODEX_HOME"]).is_dir()
                 (home / "auth.json").write_text(json.dumps({"kind": "api-key-login"}) + "\\n")
                 """
@@ -676,10 +696,113 @@ class CodexSwitcherTests(unittest.TestCase):
         ]
         result = subprocess.run(cmd, text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("12%", result.stdout)
-        self.assertIn("34%", result.stdout)
+        self.assertIn("88%", result.stdout)
+        self.assertIn("66%", result.stdout)
         cache = json.loads((context_dir / "rate_limits.json").read_text(encoding="utf-8"))
         self.assertEqual(cache["snapshot"]["planType"], "plus")
+
+    def test_rate_limit_summary_reports_percent_remaining(self) -> None:
+        summary = codexswitcher.summarize_rate_limits(
+            {
+                "planType": "plus",
+                "primary": {"usedPercent": 12, "resetsAt": 1800000000},
+                "secondary": {"usedPercent": 34, "resetsAt": 1800100000},
+            },
+            source="cached",
+        )
+        self.assertEqual(summary["five_hour"], "88%")
+        self.assertEqual(summary["weekly"], "66%")
+        self.assertIn("88% remaining", summary["five_hour_detail"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows launcher smoke test")
+    def test_powershell_launcher_runs_python_version(self) -> None:
+        result = subprocess.run(
+            [
+                "pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "codexswitcher.ps1"),
+                "--codex-home",
+                str(self.codex_home),
+                "--store",
+                str(self.store),
+                "status",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"CODEX_HOME: {self.codex_home}", result.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "Windows installer smoke test")
+    def test_install_windows_creates_working_launchers(self) -> None:
+        bin_dir = self.root / "bin"
+        install = subprocess.run(
+            [
+                "pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "install-windows.ps1"),
+                "-BinDirectory",
+                str(bin_dir),
+                "-Copy",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertTrue((bin_dir / "cdxsw.ps1").exists())
+        self.assertTrue((bin_dir / "cdxsw.cmd").exists())
+        self.assertTrue((bin_dir / "cdxsw").exists())
+
+        status = subprocess.run(
+            [
+                "pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(bin_dir / "cdxsw.ps1"),
+                "--codex-home",
+                str(self.codex_home),
+                "--store",
+                str(self.store),
+                "status",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn(f"CODEX_HOME: {self.codex_home}", status.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "Windows masked prompt test")
+    def test_windows_secret_prompt_masks_each_character(self) -> None:
+        chars = iter(["s", "k", "\b", "x", "\r"])
+
+        with (
+            mock.patch.object(codexswitcher.sys, "stdout", StringIO()) as stdout,
+            mock.patch("msvcrt.getwch", side_effect=lambda: next(chars)),
+        ):
+            value = codexswitcher.read_windows_secret("Provider API key: ")
+
+        self.assertEqual(value, "sx")
+        self.assertEqual(stdout.getvalue(), "Provider API key: **\b \b*\n")
+
+    def test_interactive_new_context_menus_hide_advanced_secret_modes(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('("access-token", "Codex access token")', source)
+        self.assertNotIn('("provider-env", "Custom provider using an environment variable")', source)
+        self.assertNotIn('("access-token", "Codex access token from hidden prompt")', source)
 
 
 if __name__ == "__main__":

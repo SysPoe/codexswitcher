@@ -14,17 +14,20 @@ import datetime as dt
 import json
 import os
 import re
-import select
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import tomllib
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10.
+    tomllib = None  # type: ignore[assignment]
 
 try:
     import fcntl
@@ -102,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep the current auth.json when the selected context has no auth.json.",
     )
+    use.add_argument(
+        "--restart-app",
+        action="store_true",
+        help="Restart the Windows Codex app after switching.",
+    )
     use.set_defaults(func=cmd_use)
 
     provider = subparsers.add_parser(
@@ -148,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional model_reasoning_effort value for this context.",
     )
     provider.add_argument("--overwrite", action="store_true", help="Replace an existing context.")
+    provider.add_argument("--use", action="store_true", help="Install the context into CODEX_HOME after creating it.")
+    provider.add_argument(
+        "--restart-app",
+        action="store_true",
+        help="Restart the Windows Codex app after activating with --use.",
+    )
     provider.set_defaults(func=cmd_provider)
 
     login = subparsers.add_parser(
@@ -181,6 +195,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--use",
         action="store_true",
         help="Install the context into CODEX_HOME after a successful login.",
+    )
+    login.add_argument(
+        "--restart-app",
+        action="store_true",
+        help="Restart the Windows Codex app after activating with --use.",
     )
     login.set_defaults(func=cmd_login)
 
@@ -217,7 +236,9 @@ def cmd_capture(switcher: "Switcher", args: argparse.Namespace) -> int:
 def cmd_use(switcher: "Switcher", args: argparse.Namespace) -> int:
     switcher.use(args.name, keep_auth=args.keep_auth)
     print(f"activated context {args.name!r} in {switcher.codex_home}")
-    if switcher.app_server_may_be_running():
+    if args.restart_app:
+        switcher.restart_codex_app()
+    elif switcher.app_server_may_be_running():
         print("note: Codex app/app-server may need a restart to pick up auth/config changes.")
     return 0
 
@@ -238,6 +259,13 @@ def cmd_provider(switcher: "Switcher", args: argparse.Namespace) -> int:
         overwrite=args.overwrite,
     )
     print(f"created provider context {args.name!r}")
+    if args.use:
+        switcher.use(args.name)
+        print(f"activated context {args.name!r} in {switcher.codex_home}")
+        if args.restart_app:
+            switcher.restart_codex_app()
+        elif switcher.app_server_may_be_running():
+            print("note: Codex app/app-server may need a restart to pick up auth/config changes.")
     return 0
 
 
@@ -255,6 +283,10 @@ def cmd_login(switcher: "Switcher", args: argparse.Namespace) -> int:
     print(f"stored login credentials in context {args.name!r}")
     if args.use:
         print(f"activated context {args.name!r} in {switcher.codex_home}")
+        if args.restart_app:
+            switcher.restart_codex_app()
+        elif switcher.app_server_may_be_running():
+            print("note: Codex app/app-server may need a restart to pick up auth/config changes.")
     return 0
 
 
@@ -294,6 +326,9 @@ def cmd_tui(switcher: "Switcher", args: argparse.Namespace) -> int:
         print("non-interactive shell detected; use `codexswitcher.py use <name>` to activate a context.")
         return 0
 
+    if os.name == "nt":
+        return windows_tui(switcher, message="")
+
     message = ""
     while True:
         rows = switcher.list_contexts(refresh_limits=False)
@@ -332,8 +367,8 @@ def execute_tui_action(switcher: "Switcher", action: dict[str, str]) -> str:
             base_url=action["base_url"],
             wire_api=action["wire_api"],
             supports_websockets=None,
-            env_key=None,
-            api_key=action["api_key"],
+            env_key=action.get("env_key"),
+            api_key=action.get("api_key"),
             requires_openai_auth=False,
             reasoning_effort=None,
             overwrite=False,
@@ -408,6 +443,327 @@ def format_context_table(rows: list[dict[str, str]]) -> str:
             f"{row['weekly']:<{widths['weekly']}}"
         )
     return "\n".join(lines)
+
+
+def windows_tui(switcher: "Switcher", message: str = "") -> int:
+    import msvcrt
+
+    selected = 0
+    top = 0
+    refresh_queue: Queue[tuple[str | None, dict[str, str]]] | None = None
+    fetching_limits = False
+    popup_expires_at = time.monotonic() + TUI_POPUP_SECONDS if message else 0.0
+
+    def show_popup(text: str) -> None:
+        nonlocal message, popup_expires_at
+        message = text
+        popup_expires_at = time.monotonic() + TUI_POPUP_SECONDS
+
+    def clear_popup() -> None:
+        nonlocal message, popup_expires_at
+        message = ""
+        popup_expires_at = 0.0
+
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    sys.stdout.flush()
+    try:
+        while True:
+            rows = switcher.list_contexts(refresh_limits=False)
+            if refresh_queue is None:
+                refresh_queue = start_limit_refresh(switcher, rows)
+                fetching_limits = has_refreshable_limits(rows)
+            if refresh_queue is not None:
+                updated, finished_refresh = apply_limit_refresh_updates(rows, refresh_queue)
+                if finished_refresh:
+                    refresh_queue = None
+                    fetching_limits = False
+                if updated and not message:
+                    show_popup("Rate limits updated.")
+
+            width, height = terminal_size()
+            detail_lines = 8
+            list_height = max(1, height - detail_lines - 5)
+            if rows:
+                selected = max(0, min(selected, len(rows) - 1))
+            else:
+                selected = 0
+            if selected < top:
+                top = selected
+            elif selected >= top + list_height:
+                top = selected - list_height + 1
+            if message and time.monotonic() >= popup_expires_at:
+                clear_popup()
+
+            lines = render_tui_lines(rows, switcher, selected, top, list_height, width, height)
+            if message:
+                lines[-1] = centered_popup(message, width)
+            elif fetching_limits:
+                lines[-1] = fit_line("Fetching rate limits...", width)
+            else:
+                lines[-1] = fit_line("Ready.", width)
+            write_windows_frame(lines)
+
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                continue
+            key = read_windows_key(msvcrt)
+            if key in {"up", "k"}:
+                clear_popup()
+                selected -= 1
+            elif key in {"down", "j"}:
+                clear_popup()
+                selected += 1
+            elif key in {"pagedown", "space"}:
+                clear_popup()
+                selected += list_height
+            elif key == "pageup":
+                clear_popup()
+                selected -= list_height
+            elif key in {"home", "g"}:
+                clear_popup()
+                selected = 0
+            elif key in {"end", "G"}:
+                clear_popup()
+                selected = len(rows) - 1
+            elif key == "enter":
+                if rows:
+                    name = rows[selected]["name"]
+                    try:
+                        switcher.use(name)
+                        text = f"Activated context {name!r}. Restart Codex app to apply it."
+                    except SwitcherError as exc:
+                        text = f"error: {exc}"
+                    show_popup(text)
+                else:
+                    show_popup("No context selected. Press n to create one.")
+            elif key == "n":
+                action = prompt_new_context_windows()
+                if action is not None:
+                    show_popup(execute_windows_tui_action(switcher, action))
+                    refresh_queue = None
+                    selected = next(
+                        (index for index, row in enumerate(switcher.list_contexts(False)) if row["name"] == action["name"]),
+                        selected,
+                    )
+            elif key == "delete":
+                if rows:
+                    name = rows[selected]["name"]
+                    if confirm_windows(f"Delete {name!r}? y/N "):
+                        switcher.delete_context(name)
+                        show_popup(f"Deleted context {name!r}.")
+                        refresh_queue = None
+                        selected = max(0, selected - 1)
+                    else:
+                        show_popup("Delete cancelled.")
+            elif key == "r":
+                refresh_queue = start_limit_refresh(switcher, rows)
+                fetching_limits = has_refreshable_limits(rows)
+                if fetching_limits:
+                    show_popup("Fetching rate limits for all contexts...")
+                else:
+                    show_popup("No refreshable Codex/OpenAI contexts.")
+            elif key in {"escape", "q"}:
+                return 0
+            elif key:
+                show_popup("Unknown key. Enter activates, n adds, Delete removes, q exits.")
+    finally:
+        sys.stdout.write("\x1b[?25h\x1b[0m\n")
+        sys.stdout.flush()
+
+
+def render_tui_lines(
+    rows: list[dict[str, str]],
+    switcher: "Switcher",
+    selected: int,
+    top: int,
+    list_height: int,
+    width: int,
+    height: int,
+) -> list[str]:
+    lines = [" " * width for _ in range(height)]
+    put_line(lines, 0, "Codex Switcher", width)
+    put_line(lines, 1, f"CODEX_HOME: {switcher.codex_home}", width)
+    put_line(lines, 2, "Enter: activate  Delete: delete  n: new  r: refresh  Up/Down or j/k: move  q/Esc: quit", width)
+    put_line(lines, 3, "-" * width, width)
+    if not rows:
+        put_line(lines, 4, "No saved contexts. Press n to create one.", width)
+    else:
+        for offset, row in enumerate(rows[top : top + list_height]):
+            index = top + offset
+            active = "*" if row["active"] else " "
+            marker = ">" if index == selected else " "
+            text = (
+                f"{active}{marker} {row['name']:<22.22} {row['model']:<14.14} "
+                f"{row['provider']:<12.12} auth:{row['auth']:<3} "
+                f"5h:{row['five_hour']:<10.10} wk:{row['weekly']:<10.10}"
+            )
+            put_line(lines, 4 + offset, text, width)
+    detail_y = min(max(4, height - 9), 5 + list_height)
+    put_line(lines, detail_y, "-" * width, width)
+    if rows:
+        row = rows[selected]
+        detail = [
+            f"name:          {row['name']}",
+            f"model:         {row['model']}",
+            f"provider:      {row['provider']}",
+            f"auth:          {row['auth']}",
+            f"provider auth: {row['provider_auth']}",
+            f"five-hour:     {row['five_hour_detail']}",
+            f"weekly:        {row['weekly_detail']}",
+        ]
+    else:
+        detail = ["Press n to sign in with ChatGPT and save the account as a context."]
+    for offset, text in enumerate(detail, start=1):
+        put_line(lines, detail_y + offset, text, width)
+    return lines
+
+
+def terminal_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size(fallback=(100, 30))
+    return max(30, size.columns - 1), max(12, size.lines)
+
+
+def put_line(lines: list[str], y: int, text: str, width: int) -> None:
+    if 0 <= y < len(lines):
+        lines[y] = fit_line(text, width)
+
+
+def fit_line(text: str, width: int) -> str:
+    return text[:width].ljust(width)
+
+
+def centered_popup(text: str, width: int) -> str:
+    popup = f" {text} "
+    if len(popup) > width:
+        popup = popup[:width]
+    return popup.center(width)
+
+
+def write_windows_frame(lines: list[str]) -> None:
+    frame = ["\x1b[?2026h"]
+    for index, line in enumerate(lines, start=1):
+        frame.append(f"\x1b[{index};1H{line}\x1b[0m")
+    frame.append("\x1b[1;1H\x1b[?2026l")
+    sys.stdout.write("".join(frame))
+    sys.stdout.flush()
+
+
+def read_windows_key(msvcrt_module: Any) -> str:
+    raw = msvcrt_module.getwch()
+    if raw in ("\x00", "\xe0"):
+        extended = msvcrt_module.getwch()
+        return {
+            "H": "up",
+            "P": "down",
+            "K": "left",
+            "M": "right",
+            "S": "delete",
+            "I": "pageup",
+            "Q": "pagedown",
+            "G": "home",
+            "O": "end",
+        }.get(extended, "")
+    return {
+        "\r": "enter",
+        "\x1b": "escape",
+        " ": "space",
+        "\x08": "backspace",
+    }.get(raw, raw)
+
+
+def prompt_new_context_windows() -> dict[str, str] | None:
+    print("\x1b[?25h\x1b[2J\x1b[1;1H", end="", flush=True)
+    name = input("New context name: ").strip()
+    if not name:
+        return None
+    validate_context_name(name)
+    options = [
+        ("browser", "ChatGPT browser login"),
+        ("device", "ChatGPT device-code login"),
+        ("api-key", "OpenAI API key"),
+        ("provider", "Custom provider API endpoint and key"),
+    ]
+    for index, (_, label) in enumerate(options, start=1):
+        print(f"{index}. {label}")
+    choice = input("Choose context type: ").strip()
+    try:
+        mode = options[int(choice) - 1][0]
+    except (ValueError, IndexError):
+        return None
+    if mode == "provider":
+        api_key = read_windows_secret("Provider API key: ").strip()
+        if not api_key:
+            raise SwitcherError("Provider API key cannot be empty")
+        action = prompt_provider_config_windows(name)
+        if action is not None:
+            action["api_key"] = api_key
+        return action
+    return {"action": "login", "name": name, "mode": mode}
+
+
+def prompt_provider_config_windows(name: str) -> dict[str, str] | None:
+    provider_id = input("Provider id (for example customapi): ").strip()
+    validate_provider_id(provider_id)
+    provider_name = input(f"Provider display name (default {provider_id}): ").strip()
+    base_url = input("Provider API base URL: ").strip()
+    if not base_url:
+        raise SwitcherError("Provider API base URL is required")
+    model = input("Model (default gpt-5.5): ").strip() or "gpt-5.5"
+    wire_api = input("Wire API (default responses): ").strip() or "responses"
+    return {
+        "action": "provider",
+        "name": name,
+        "provider_id": provider_id,
+        "provider_name": provider_name or provider_id,
+        "base_url": base_url,
+        "model": model,
+        "wire_api": wire_api,
+    }
+
+
+def execute_windows_tui_action(switcher: "Switcher", action: dict[str, str]) -> str:
+    try:
+        return execute_tui_action(switcher, action)
+    except SwitcherError as exc:
+        return f"error: {exc}"
+
+
+def confirm_windows(prompt: str) -> bool:
+    print("\x1b[?25h\x1b[2J\x1b[1;1H", end="", flush=True)
+    return input(prompt).strip().lower() == "y"
+
+
+def read_windows_secret(prompt: str) -> str:
+    import msvcrt
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    chars: list[str] = []
+    while True:
+        char = msvcrt.getwch()
+        if char in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "".join(chars)
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char == "\x1b":
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return ""
+        if char == "\b":
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        if char in ("\x00", "\xe0"):
+            with contextlib.suppress(Exception):
+                msvcrt.getwch()
+            continue
+        chars.append(char)
+        sys.stdout.write("*")
+        sys.stdout.flush()
 
 
 def select_context_tui(rows: list[dict[str, str]], switcher: "Switcher", initial_message: str = "") -> None:
@@ -685,7 +1041,6 @@ def prompt_new_login_tui(stdscr: Any) -> dict[str, str] | None:
         ("browser", "ChatGPT browser login"),
         ("device", "ChatGPT device-code login for SSH/headless sessions"),
         ("api-key", "OpenAI API key for OpenAI endpoints"),
-        ("access-token", "Codex access token from hidden prompt"),
         ("provider", "Custom provider API key, e.g. Custom API"),
     ]
     selected = 0
@@ -730,7 +1085,7 @@ def prompt_provider_config_tui(stdscr: Any, name: str, api_key: str) -> dict[str
         show_curses_message(stdscr, "Invalid provider id. Use letters, numbers, underscore, or hyphen.")
         return None
 
-    provider_name = read_curses_prompt(stdscr, "Provider display name (optional): ")
+    provider_name = read_curses_prompt(stdscr, f"Provider display name (default {provider_id}): ")
     base_url = read_curses_prompt(stdscr, "Provider API base URL: ")
     if base_url is None or not base_url.strip():
         show_curses_message(stdscr, "Provider API base URL is required for custom providers.")
@@ -741,7 +1096,7 @@ def prompt_provider_config_tui(stdscr: Any, name: str, api_key: str) -> dict[str
         "action": "provider",
         "name": name,
         "provider_id": provider_id,
-        "provider_name": (provider_name or "").strip(),
+        "provider_name": (provider_name or provider_id).strip() or provider_id,
         "base_url": base_url.strip(),
         "model": (model or "gpt-5.5").strip() or "gpt-5.5",
         "wire_api": (wire_api or "responses").strip() or "responses",
@@ -775,6 +1130,7 @@ def read_curses_secret_prompt(stdscr: Any, prompt: str) -> str | None:
     import curses
 
     curses.noecho()
+    stdscr.keypad(True)
     with contextlib.suppress(curses.error):
         curses.curs_set(1)
     try:
@@ -782,11 +1138,27 @@ def read_curses_secret_prompt(stdscr: Any, prompt: str) -> str | None:
         height, width = stdscr.getmaxyx()
         add_line(stdscr, 0, 0, prompt, width, curses.A_BOLD)
         add_line(stdscr, 2, 0, "Press Enter to continue, or leave blank to cancel.", width)
-        stdscr.move(0, min(len(prompt), max(0, width - 1)))
+        input_x = min(len(prompt), max(0, width - 1))
+        max_chars = max(1, width - input_x - 1)
+        stdscr.move(0, input_x)
         stdscr.refresh()
-        raw = stdscr.getstr(0, min(len(prompt), max(0, width - 1)), max(1, width - len(prompt) - 1))
-        value = raw.decode("utf-8", errors="ignore")
-        return value if value else None
+        chars: list[str] = []
+        while True:
+            key = stdscr.get_wch()
+            if key in ("\n", "\r") or key == curses.KEY_ENTER:
+                return "".join(chars) if chars else None
+            if key == "\x1b":
+                return None
+            if key in ("\b", "\x7f") or key == curses.KEY_BACKSPACE:
+                if chars:
+                    chars.pop()
+                    stdscr.move(0, input_x + min(len(chars), max_chars - 1))
+                    stdscr.delch()
+                continue
+            if isinstance(key, str) and key >= " " and len(chars) < max_chars:
+                chars.append(key)
+                stdscr.addstr(0, input_x + len(chars) - 1, "*")
+                stdscr.refresh()
     finally:
         curses.noecho()
         with contextlib.suppress(curses.error):
@@ -977,13 +1349,12 @@ class Switcher:
                 provider_config: dict[str, Any] = {}
                 provider_config["base_url"] = base_url
                 provider_config["wire_api"] = wire_api or "responses"
-                if provider_name:
-                    provider_config["name"] = provider_name
+                provider_config["name"] = provider_name or provider_id
                 providers[provider_id] = provider_config
         else:
             providers = ensure_table(config, "model_providers")
             provider_config = dict(existing_provider_config or {})
-            provider_config["name"] = provider_name or str(provider_config.get("name") or provider_id)
+            provider_config["name"] = provider_name or provider_id
             if base_url:
                 provider_config["base_url"] = base_url
             if not provider_config.get("base_url"):
@@ -1053,13 +1424,14 @@ class Switcher:
         write_text_secret(context_dir / "config.toml", dumps_toml(config))
 
         home = self.prepare_isolated_home(name)
-        login_cmd = [self.codex_bin, "login"]
+        login_args = ["login"]
         if device_auth:
-            login_cmd.append("--device-auth")
+            login_args.append("--device-auth")
         if with_api_key:
-            login_cmd.append("--with-api-key")
+            login_args.append("--with-api-key")
         if with_access_token:
-            login_cmd.append("--with-access-token")
+            login_args.append("--with-access-token")
+        login_cmd = command_for_subprocess(self.codex_bin, login_args)
 
         env = os.environ.copy()
         env["CODEX_HOME"] = str(home)
@@ -1087,6 +1459,10 @@ class Switcher:
         home = self.prepare_isolated_home(name)
         env = os.environ.copy()
         env["CODEX_HOME"] = str(home)
+        if cmd and cmd[0] == "codex":
+            cmd = command_for_subprocess(self.codex_bin, cmd[1:])
+        else:
+            cmd = command_for_subprocess(cmd[0], cmd[1:])
         result = subprocess.run(cmd, env=env)
 
         isolated_auth = home / "auth.json"
@@ -1230,7 +1606,7 @@ class Switcher:
         return self.contexts_dir / name
 
     def backup_active_files(self, reason: str) -> None:
-        timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
         backup_dir = unique_path(self.backups_dir / f"{timestamp}-{sanitize_filename(reason)}")
         ensure_dir(backup_dir, mode=0o700)
         for file_name in ("config.toml", "auth.json"):
@@ -1269,6 +1645,8 @@ class Switcher:
         return name if isinstance(name, str) else None
 
     def app_server_may_be_running(self) -> bool:
+        if os.name == "nt":
+            return bool(find_windows_process_ids("Codex"))
         pid_file = self.codex_home / "app-server-daemon" / "app-server.pid"
         if not pid_file.exists():
             return False
@@ -1277,6 +1655,24 @@ class Switcher:
         except (OSError, ValueError):
             return True
         return Path(f"/proc/{pid}").exists()
+
+    def restart_codex_app(self) -> None:
+        if os.name != "nt":
+            if self.app_server_may_be_running():
+                print("note: automatic app restart is only implemented on Windows.")
+            return
+        for pid in find_windows_process_ids("Codex"):
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        if launch_windows_codex_app():
+            print("restarted Codex app.")
+        else:
+            print("note: Codex app was stopped but could not be located for relaunch.")
 
 
 def provider_auth_summary(config: dict[str, Any]) -> str:
@@ -1307,6 +1703,79 @@ def uses_codex_rate_limits(config: dict[str, Any]) -> bool:
     return isinstance(provider, dict) and bool(provider.get("requires_openai_auth"))
 
 
+def find_windows_process_ids(image_name: str) -> list[int]:
+    if os.name != "nt":
+        return []
+    command = [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-Command",
+        f"Get-Process -Name {json.dumps(image_name)} -ErrorAction SilentlyContinue | ForEach-Object Id",
+    ]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    ids: list[int] = []
+    for line in result.stdout.splitlines():
+        with contextlib.suppress(ValueError):
+            ids.append(int(line.strip()))
+    return ids
+
+
+def launch_windows_codex_app() -> bool:
+    candidates: list[list[str]] = []
+    package_family = get_windows_codex_package_family()
+    if package_family:
+        candidates.append(["explorer.exe", f"shell:AppsFolder\\{package_family}!App"])
+    candidates.append(["explorer.exe", "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"])
+    local_app = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Codex" / "Codex.exe"
+    if local_app.exists():
+        candidates.append([str(local_app)])
+    for candidate in candidates:
+        with contextlib.suppress(OSError):
+            subprocess.Popen(candidate, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    return False
+
+
+def get_windows_codex_package_family() -> str | None:
+    command = [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-Command",
+        "(Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue).PackageFamilyName",
+    ]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def command_for_subprocess(executable: str, args: list[str]) -> list[str]:
+    if os.name != "nt":
+        return [executable, *args]
+    path = Path(executable)
+    if path.exists() and path.suffix.lower() not in {".exe", ".cmd", ".bat", ".com"}:
+        if path.suffix.lower() == ".ps1":
+            return [
+                "pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(path),
+                *args,
+            ]
+        return [sys.executable, str(path), *args]
+    return [executable, *args]
+
+
 def preserve_active_model_settings(target_config: dict[str, Any], active_config_path: Path) -> None:
     if not active_config_path.exists():
         return
@@ -1335,8 +1804,10 @@ def fetch_rate_limits_from_codex_home(
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
+    stdout_queue: Queue[str | None] = Queue()
+    stderr_queue: Queue[str] = Queue()
     proc = subprocess.Popen(
-        [codex_bin, "app-server", "--stdio"],
+        command_for_subprocess(codex_bin, ["app-server", "--stdio"]),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1357,6 +1828,22 @@ def fetch_rate_limits_from_codex_home(
         {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": None},
     ]
     stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                stdout_queue.put(line)
+        finally:
+            stdout_queue.put(None)
+
+    def read_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_queue.put(line)
+
+    threading.Thread(target=read_stdout, name="codexswitcher-rate-stdout", daemon=True).start()
+    threading.Thread(target=read_stderr, name="codexswitcher-rate-stderr", daemon=True).start()
     try:
         assert proc.stdin is not None
         for message in messages:
@@ -1365,40 +1852,40 @@ def fetch_rate_limits_from_codex_home(
 
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            streams = [stream for stream in (proc.stdout, proc.stderr) if stream is not None]
-            if not streams:
-                break
-            readable, _, _ = select.select(streams, [], [], 0.2)
-            for stream in readable:
-                line = stream.readline()
-                if not line:
-                    continue
-                if stream is proc.stderr:
-                    if len(stderr_lines) < 5:
-                        stderr_lines.append(line.strip())
-                    continue
+            while len(stderr_lines) < 5:
                 try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("id") != 2:
-                    continue
-                if "error" in payload:
-                    error = payload["error"]
-                    if isinstance(error, dict):
-                        message = str(error.get("message") or error.get("code") or error)
-                    else:
-                        message = str(error)
-                    raise SwitcherError(message)
-                result = payload.get("result")
-                if not isinstance(result, dict):
-                    raise SwitcherError("rate-limit response did not include an object result")
-                snapshot = choose_rate_limit_snapshot(result)
-                if snapshot is None:
-                    raise SwitcherError("rate-limit response did not include a Codex limit snapshot")
-                return snapshot
-            if proc.poll() is not None:
+                    stderr_lines.append(stderr_queue.get_nowait().strip())
+                except Empty:
+                    break
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                line = stdout_queue.get(timeout=min(0.2, remaining))
+            except Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if line is None:
                 break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("id") != 2:
+                continue
+            if "error" in payload:
+                error = payload["error"]
+                if isinstance(error, dict):
+                    message = str(error.get("message") or error.get("code") or error)
+                else:
+                    message = str(error)
+                raise SwitcherError(message)
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise SwitcherError("rate-limit response did not include an object result")
+            snapshot = choose_rate_limit_snapshot(result)
+            if snapshot is None:
+                raise SwitcherError("rate-limit response did not include a Codex limit snapshot")
+            return snapshot
         detail = "; ".join(line for line in stderr_lines if line)
         raise SwitcherError(f"timed out reading fresh rate limits{': ' + detail if detail else ''}")
     finally:
@@ -1473,7 +1960,7 @@ def short_window(window: dict[str, Any] | None) -> str:
         return "?"
     percent = value_by_keys(window, "usedPercent", "used_percent")
     if isinstance(percent, (int, float)):
-        return f"{percent:.0f}%"
+        return f"{max(0.0, min(100.0, 100.0 - float(percent))):.0f}%"
     return "?"
 
 
@@ -1484,7 +1971,8 @@ def detail_window(window: dict[str, Any] | None, label: str) -> str:
     resets_at = value_by_keys(window, "resetsAt", "resets_at")
     parts = [label]
     if isinstance(percent, (int, float)):
-        parts.append(f"{percent:.0f}% used")
+        remaining = max(0.0, min(100.0, 100.0 - float(percent)))
+        parts.append(f"{remaining:.0f}% remaining")
     else:
         parts.append("usage unknown")
     if isinstance(resets_at, int):
@@ -1501,22 +1989,189 @@ def value_by_keys(data: dict[str, Any], *keys: str) -> Any:
 
 def format_epoch(value: int) -> str:
     try:
-        return dt.datetime.fromtimestamp(value, dt.UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+        return dt.datetime.fromtimestamp(value, dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     except (OverflowError, OSError, ValueError):
         return str(value)
 
 
 def read_toml(path: Path) -> dict[str, Any]:
     try:
-        with path.open("rb") as file:
-            data = tomllib.load(file)
+        if tomllib is not None:
+            with path.open("rb") as file:
+                data = tomllib.load(file)
+        else:
+            data = parse_basic_toml(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SwitcherError(f"{path} does not exist") from None
-    except tomllib.TOMLDecodeError as exc:
+    except TomlParseError as exc:
+        raise SwitcherError(f"failed to parse {path}: {exc}") from None
+    except Exception as exc:
+        if exc.__class__.__name__ != "TOMLDecodeError":
+            raise
         raise SwitcherError(f"failed to parse {path}: {exc}") from None
     if not isinstance(data, dict):
         raise SwitcherError(f"{path} did not parse to a TOML table")
     return data
+
+
+class TomlParseError(ValueError):
+    pass
+
+
+def parse_basic_toml(text: str) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    current = root
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = strip_toml_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            table_name = line[1:-1].strip()
+            if not table_name:
+                raise TomlParseError(f"empty table name on line {line_number}")
+            current = root
+            for part in split_toml_dotted_key(table_name):
+                value = current.setdefault(part, {})
+                if not isinstance(value, dict):
+                    raise TomlParseError(f"table {table_name!r} conflicts with a scalar on line {line_number}")
+                current = value
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            raise TomlParseError(f"expected key = value on line {line_number}")
+        current[parse_toml_key(key.strip())] = parse_basic_toml_value(value.strip())
+    return root
+
+
+def strip_toml_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "#":
+            return line[:index]
+    return line
+
+
+def split_toml_dotted_key(key: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in key:
+        if quote:
+            current.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+        elif char == ".":
+            parts.append(parse_toml_key("".join(current).strip()))
+            current = []
+        else:
+            current.append(char)
+    if quote:
+        raise TomlParseError(f"unterminated quoted key {key!r}")
+    parts.append(parse_toml_key("".join(current).strip()))
+    return parts
+
+
+def parse_toml_key(key: str) -> str:
+    if not key:
+        raise TomlParseError("empty key")
+    if key[0] in {"'", '"'}:
+        try:
+            return json.loads(key) if key[0] == '"' else key[1:-1]
+        except json.JSONDecodeError as exc:
+            raise TomlParseError(str(exc)) from exc
+    return key
+
+
+def parse_basic_toml_value(value: str) -> Any:
+    if value.startswith('"') or value.startswith("'"):
+        if value.startswith("'"):
+            if not value.endswith("'"):
+                raise TomlParseError("unterminated literal string")
+            return value[1:-1]
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise TomlParseError(str(exc)) from exc
+    if value in {"true", "false"}:
+        return value == "true"
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [parse_basic_toml_value(part.strip()) for part in split_toml_inline_items(inner)]
+    if value.startswith("{") and value.endswith("}"):
+        inner = value[1:-1].strip()
+        result: dict[str, Any] = {}
+        if not inner:
+            return result
+        for part in split_toml_inline_items(inner):
+            key, separator, item_value = part.partition("=")
+            if not separator:
+                raise TomlParseError(f"invalid inline table item {part!r}")
+            result[parse_toml_key(key.strip())] = parse_basic_toml_value(item_value.strip())
+        return result
+    with contextlib.suppress(ValueError):
+        return int(value)
+    with contextlib.suppress(ValueError):
+        return float(value)
+    raise TomlParseError(f"unsupported TOML value {value!r}")
+
+
+def split_toml_inline_items(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for char in text:
+        if quote:
+            current.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+        elif char in "[{":
+            depth += 1
+            current.append(char)
+        elif char in "]}":
+            depth -= 1
+            current.append(char)
+        elif char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if quote:
+        raise TomlParseError("unterminated quoted inline value")
+    if current:
+        parts.append("".join(current))
+    return parts
 
 
 def dumps_toml(data: dict[str, Any]) -> str:
@@ -1646,7 +2301,7 @@ def unique_path(path: Path) -> Path:
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 if __name__ == "__main__":

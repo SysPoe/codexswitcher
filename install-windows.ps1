@@ -6,10 +6,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 $sourceDirectory = $PSScriptRoot
-$targetScript = Join-Path $sourceDirectory "codexswitcher.ps1"
+$targetScript = Join-Path $sourceDirectory "codexswitcher.py"
+$targetPowerShell = Join-Path $sourceDirectory "codexswitcher.ps1"
+$targetCmd = Join-Path $sourceDirectory "codexswitcher.cmd"
 
 if (-not (Test-Path -LiteralPath $targetScript)) {
+    throw "codexswitcher.py was not found beside this installer."
+}
+if (-not (Test-Path -LiteralPath $targetPowerShell)) {
     throw "codexswitcher.ps1 was not found beside this installer."
+}
+if (-not (Test-Path -LiteralPath $targetCmd)) {
+    throw "codexswitcher.cmd was not found beside this installer."
 }
 
 [void][System.IO.Directory]::CreateDirectory($BinDirectory)
@@ -30,7 +38,7 @@ function Install-LinkOrCopy([string]$Destination, [string]$Source) {
 
     switch ([System.IO.Path]::GetExtension($Destination).ToLowerInvariant()) {
         ".ps1" {
-            $content = "& '$($Source.Replace("'", "''"))' @args`n"
+            $content = "& '$($Source.Replace("'", "''"))' @args`nexit `$LASTEXITCODE`n"
             [System.IO.File]::WriteAllText($Destination, $content, [System.Text.UTF8Encoding]::new($false))
         }
         ".cmd" {
@@ -52,14 +60,14 @@ endlocal & exit /b %CODEXSWITCHER_EXIT%
         }
         default {
             $unixSource = $Source.Replace("\", "/").Replace("'", "'\''")
-            $content = "#!/usr/bin/env sh`nexec pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File '$unixSource' `"`$@`"`n"
+            $content = "#!/usr/bin/env sh`nSCRIPT='$unixSource'`nif command -v python3 >/dev/null 2>&1; then exec python3 `"`$SCRIPT`" `"`$@`"; fi`nexec python `"`$SCRIPT`" `"`$@`"`n"
             [System.IO.File]::WriteAllText($Destination, $content, [System.Text.UTF8Encoding]::new($false))
         }
     }
 }
 
-Install-LinkOrCopy (Join-Path $BinDirectory "cdxsw.ps1") $targetScript
-Install-LinkOrCopy (Join-Path $BinDirectory "cdxsw.cmd") (Join-Path $sourceDirectory "codexswitcher.cmd")
+Install-LinkOrCopy (Join-Path $BinDirectory "cdxsw.ps1") $targetPowerShell
+Install-LinkOrCopy (Join-Path $BinDirectory "cdxsw.cmd") $targetCmd
 Install-LinkOrCopy (Join-Path $BinDirectory "cdxsw") $targetScript
 
 Write-Host "Installed cdxsw launchers in $BinDirectory"
