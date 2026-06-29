@@ -450,6 +450,7 @@ def windows_tui(switcher: "Switcher", message: str = "") -> int:
 
     selected = 0
     top = 0
+    last_frame_height = terminal_size()[1]
     refresh_queue: Queue[tuple[str | None, dict[str, str]]] | None = None
     fetching_limits = False
     popup_expires_at = time.monotonic() + TUI_POPUP_SECONDS if message else 0.0
@@ -494,6 +495,7 @@ def windows_tui(switcher: "Switcher", message: str = "") -> int:
             if message and time.monotonic() >= popup_expires_at:
                 clear_popup()
 
+            last_frame_height = height
             lines = render_tui_lines(rows, switcher, selected, top, list_height, width, height)
             if message:
                 lines[-1] = centered_popup(message, width)
@@ -567,7 +569,7 @@ def windows_tui(switcher: "Switcher", message: str = "") -> int:
             elif key:
                 show_popup("Unknown key. Enter activates, n adds, Delete removes, q exits.")
     finally:
-        sys.stdout.write("\x1b[?25h\x1b[0m\n")
+        sys.stdout.write(windows_tui_exit_sequence(last_frame_height))
         sys.stdout.flush()
 
 
@@ -646,6 +648,11 @@ def write_windows_frame(lines: list[str]) -> None:
     frame.append("\x1b[1;1H\x1b[?2026l")
     sys.stdout.write("".join(frame))
     sys.stdout.flush()
+
+
+def windows_tui_exit_sequence(frame_height: int) -> str:
+    row = max(1, frame_height)
+    return f"\x1b[?2026l\x1b[?25h\x1b[0m\x1b[{row};1H\x1b[0K\n"
 
 
 def read_windows_key(msvcrt_module: Any) -> str:
@@ -941,19 +948,28 @@ def start_limit_refresh(switcher: "Switcher", rows: list[dict[str, str]]) -> Que
     if not names:
         return queue
 
-    def refresh() -> None:
-        for name in names:
-            try:
-                context_dir = switcher.require_context(name)
-                config = read_toml(context_dir / "config.toml")
-                summary = switcher.context_limit_summary(context_dir, config, refresh=True)
-            except SwitcherError as exc:
-                summary = empty_limit_summary("unavailable", f"fetch failed: {exc}")
-            queue.put((name, summary))
-        queue.put((None, {}))
+    remaining = len(names)
+    remaining_lock = threading.Lock()
 
-    thread = threading.Thread(target=refresh, name="codexswitcher-limit-refresh", daemon=True)
-    thread.start()
+    def refresh_one(name: str) -> None:
+        nonlocal remaining
+        try:
+            context_dir = switcher.require_context(name)
+            config = read_toml(context_dir / "config.toml")
+            summary = switcher.context_limit_summary(context_dir, config, refresh=True)
+        except SwitcherError as exc:
+            summary = empty_limit_summary("unavailable", f"fetch failed: {exc}")
+        finally:
+            with remaining_lock:
+                remaining -= 1
+                finished = remaining == 0
+        queue.put((name, summary))
+        if finished:
+            queue.put((None, {}))
+
+    for name in names:
+        thread = threading.Thread(target=refresh_one, args=(name,), name=f"codexswitcher-limit-{name}", daemon=True)
+        thread.start()
     return queue
 
 

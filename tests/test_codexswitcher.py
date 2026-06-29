@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -713,6 +714,54 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertEqual(summary["five_hour"], "88%")
         self.assertEqual(summary["weekly"], "66%")
         self.assertIn("88% remaining", summary["five_hour_detail"])
+
+    def test_limit_refresh_runs_contexts_concurrently(self) -> None:
+        switcher = codexswitcher.Switcher(self.store, self.codex_home, "codex")
+        started: list[str] = []
+        original_summary = switcher.context_limit_summary
+
+        for name in ("one", "two", "three"):
+            context = self.store / "contexts" / name
+            context.mkdir(parents=True)
+            (context / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+            (context / "auth.json").write_text("{}\n", encoding="utf-8")
+
+        def fake_summary(context_dir: Path, config: dict[str, object], refresh: bool = False) -> dict[str, str]:
+            del config, refresh
+            started.append(context_dir.name)
+            time.sleep(0.25)
+            return codexswitcher.empty_limit_summary(context_dir.name, context_dir.name)
+
+        switcher.context_limit_summary = fake_summary  # type: ignore[method-assign]
+        try:
+            started_at = time.monotonic()
+            queue = codexswitcher.start_limit_refresh(
+                switcher,
+                [
+                    {"name": "one", "auth": "yes", "provider_auth": "codex-auth"},
+                    {"name": "two", "auth": "yes", "provider_auth": "codex-auth"},
+                    {"name": "three", "auth": "yes", "provider_auth": "codex-auth"},
+                ],
+            )
+            results: dict[str | None, dict[str, str]] = {}
+            while None not in results:
+                name, summary = queue.get(timeout=2)
+                results[name] = summary
+            elapsed = time.monotonic() - started_at
+        finally:
+            switcher.context_limit_summary = original_summary  # type: ignore[method-assign]
+
+        self.assertLess(elapsed, 0.6)
+        self.assertCountEqual(started, ["one", "two", "three"])
+        self.assertEqual(results["one"]["five_hour"], "one")
+        self.assertEqual(results["two"]["five_hour"], "two")
+        self.assertEqual(results["three"]["five_hour"], "three")
+
+    def test_windows_tui_exit_sequence_moves_prompt_below_frame(self) -> None:
+        self.assertEqual(
+            codexswitcher.windows_tui_exit_sequence(17),
+            "\x1b[?2026l\x1b[?25h\x1b[0m\x1b[17;1H\x1b[0K\n",
+        )
 
     @unittest.skipUnless(os.name == "nt", "Windows launcher smoke test")
     def test_powershell_launcher_runs_python_version(self) -> None:
