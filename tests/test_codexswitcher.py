@@ -702,6 +702,33 @@ class CodexSwitcherTests(unittest.TestCase):
         cache = json.loads((context_dir / "rate_limits.json").read_text(encoding="utf-8"))
         self.assertEqual(cache["snapshot"]["planType"], "plus")
 
+    def test_list_reports_missing_codex_binary_as_unavailable_rate_limits(self) -> None:
+        self.run_switcher(
+            "provider",
+            "openai-work",
+            "--provider-id",
+            "openai",
+            "--model",
+            "gpt-5.5",
+        )
+        context_dir = self.store / "contexts" / "openai-work"
+        (context_dir / "auth.json").write_text('{"kind":"auth"}\n', encoding="utf-8")
+        cmd = [
+            sys.executable,
+            str(SCRIPT),
+            "--codex-home",
+            str(self.codex_home),
+            "--store",
+            str(self.store),
+            "--codex-bin",
+            str(self.root / "missing-codex"),
+            "list",
+        ]
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("openai-work", result.stdout)
+        self.assertIn("unavailable", result.stdout)
+
     def test_rate_limit_summary_reports_percent_remaining(self) -> None:
         summary = codexswitcher.summarize_rate_limits(
             {
@@ -756,6 +783,36 @@ class CodexSwitcherTests(unittest.TestCase):
         self.assertEqual(results["one"]["five_hour"], "one")
         self.assertEqual(results["two"]["five_hour"], "two")
         self.assertEqual(results["three"]["five_hour"], "three")
+
+    def test_limit_refresh_reports_unexpected_worker_errors(self) -> None:
+        switcher = codexswitcher.Switcher(self.store, self.codex_home, "codex")
+        original_summary = switcher.context_limit_summary
+        context = self.store / "contexts" / "gmail-bob"
+        context.mkdir(parents=True)
+        (context / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        (context / "auth.json").write_text("{}\n", encoding="utf-8")
+
+        def fake_summary(context_dir: Path, config: dict[str, object], refresh: bool = False) -> dict[str, str]:
+            del context_dir, config, refresh
+            raise RuntimeError("boom")
+
+        switcher.context_limit_summary = fake_summary  # type: ignore[method-assign]
+        try:
+            queue = codexswitcher.start_limit_refresh(
+                switcher,
+                [{"name": "gmail-bob", "auth": "yes", "provider_auth": "codex-auth"}],
+            )
+            name, summary = queue.get(timeout=2)
+            finish_name, finish_summary = queue.get(timeout=2)
+        finally:
+            switcher.context_limit_summary = original_summary  # type: ignore[method-assign]
+
+        self.assertEqual(name, "gmail-bob")
+        self.assertEqual(summary["five_hour"], "unavailable")
+        self.assertEqual(summary["weekly"], "unavailable")
+        self.assertIn("fetch failed: boom", summary["limits_cache"])
+        self.assertIsNone(finish_name)
+        self.assertEqual(finish_summary, {})
 
     def test_windows_tui_exit_sequence_moves_prompt_below_frame(self) -> None:
         self.assertEqual(

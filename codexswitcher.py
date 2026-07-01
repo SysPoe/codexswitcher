@@ -957,7 +957,7 @@ def start_limit_refresh(switcher: "Switcher", rows: list[dict[str, str]]) -> Que
             context_dir = switcher.require_context(name)
             config = read_toml(context_dir / "config.toml")
             summary = switcher.context_limit_summary(context_dir, config, refresh=True)
-        except SwitcherError as exc:
+        except Exception as exc:
             summary = empty_limit_summary("unavailable", f"fetch failed: {exc}")
         finally:
             with remaining_lock:
@@ -1822,15 +1822,18 @@ def fetch_rate_limits_from_codex_home(
     env["CODEX_HOME"] = str(codex_home)
     stdout_queue: Queue[str | None] = Queue()
     stderr_queue: Queue[str] = Queue()
-    proc = subprocess.Popen(
-        command_for_subprocess(codex_bin, ["app-server", "--stdio"]),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
+    try:
+        proc = subprocess.Popen(
+            command_for_subprocess(codex_bin, ["app-server", "--stdio"]),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+    except OSError as exc:
+        raise SwitcherError(f"failed to start Codex app server: {exc}") from None
     messages = [
         {
             "jsonrpc": "2.0",
